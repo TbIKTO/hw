@@ -2,7 +2,7 @@
 HolyWorld Telegram API Server
 Читает сообщения от liteeventbot, парсит шахты, сортирует по времени.
 """
-import os, json, asyncio, re, logging
+import os, json, asyncio, re, logging, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from telethon import TelegramClient, events
@@ -20,34 +20,44 @@ PORT     = int(os.environ.get("PORT", 8080))
 
 # Хранилище: список {"name": "СолоЛайт #13", "seconds": 5, "display": "СолоЛайт #13 - 5с"}
 _mines = []
+_last_update_time = 0.0
 _raw   = ""
+
+_pattern = re.compile(
+    r'((?:Соло|Дуо|Трио|Клан)Лайт(?:\s*\([^)]+\))?)\s*#(\d+)\s*(?:[-–]\s*)?(\d+)\s*(?:сек|с|sec)',
+    re.UNICODE | re.IGNORECASE
+)
 
 def parse_mines(text: str) -> list:
     """
     Парсит текст сообщения бота.
-    Формат строки: "СолоЛайт #13 - 5с" или "ДуоЛайт #38 - 0с"
+    Поддерживает различные форматы с и без дефиса, маркдауна и т.д.
     """
     mines = []
-    for line in text.split("\n"):
-        line = line.strip()
-        # Убираем markdown символы ** и *
-        line = line.replace("**", "").replace("*", "").strip()
-        if not line:
-            continue
-        # Пробуем найти паттерн: ИмяРежима #Номер - Времяс
-        # Например: "СолоЛайт #4 - 0с" или "ДуоЛайт #23 - 5с"
-        m = re.match(r"(.+?)\s*#(\d+)\s*[-–]\s*(\d+)\s*[сc]", line, re.IGNORECASE)
-        if m:
-            name    = m.group(1).strip()
-            number  = int(m.group(2))
-            seconds = int(m.group(3))
-            mines.append({
-                "name":    name,
-                "number":  number,
-                "seconds": seconds,
-                "display": f"{name} #{number} - {seconds}с"
-            })
+    clean_text = text.replace("**", "").replace("*", "").replace("`", "")
+    for m in _pattern.finditer(clean_text):
+        name    = m.group(1).strip()
+        number  = int(m.group(2))
+        seconds = int(m.group(3))
+        mines.append({
+            "name":    name,
+            "number":  number,
+            "seconds": seconds,
+            "display": f"{name} #{number} - {seconds}с"
+        })
     return mines
+
+def get_current_mines() -> list:
+    """Возвращает актуальный список шахт с учетом прошедшего времени."""
+    if not _mines:
+        return []
+    elapsed = int(time.time() - _last_update_time)
+    updated_mines = []
+    for m in _mines:
+        m_copy = dict(m)
+        m_copy["seconds"] = max(0, m_copy["seconds"] - elapsed)
+        updated_mines.append(m_copy)
+    return updated_mines
 
 def mines_to_lines(mines: list) -> list:
     """Конвертирует список шахт в строки для overlay, сортируя по времени."""
@@ -81,7 +91,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-        lines = mines_to_lines(_mines)
+        lines = mines_to_lines(get_current_mines())
         body  = json.dumps(lines, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -98,36 +108,55 @@ async def main():
     await client.start()
     log.info("Telegram авторизован!")
 
-    async def refresh():
-        global _mines, _raw
+    async def fetch_snapshot():
+        global _mines, _raw, _last_update_time
         try:
-            entity   = await client.get_entity(BOT_USER)
-            messages = await client.get_messages(entity, limit=5)
-            for msg in messages:
-                if msg.text and ("#" in msg.text or "Шахт" in msg.text):
-                    _raw   = msg.text
-                    _mines = parse_mines(msg.text)
-                    log.info(f"Найдено {len(_mines)} шахт")
-                    if _mines:
-                        break
+            entity = await client.get_entity(BOT_USER)
+            prev_msgs = await client.get_messages(entity, limit=1)
+            prev_id = prev_msgs[0].id if prev_msgs else 0
+
+            await client.send_message(entity, "Снимок шахт")
+
+            for _ in range(20):
+                await asyncio.sleep(0.5)
+                msgs = await client.get_messages(entity, limit=1)
+                if msgs and msgs[0].id > prev_id and msgs[0].text:
+                    parsed = parse_mines(msgs[0].text)
+                    if parsed:
+                        _mines = parsed
+                        _raw = msgs[0].text
+                        _last_update_time = time.time()
+                        log.info(f"Найдено {len(_mines)} шахт")
+                        return
+                    else:
+                        log.warning(f"Не удалось распарсить ответ бота: {msgs[0].text[:100]}...")
+            log.warning("Бот не ответил на 'Снимок шахт' за 10 секунд")
         except Exception as e:
-            log.error(f"Ошибка: {e}")
+            log.error(f"Ошибка при запросе снимка: {e}")
 
     @client.on(events.NewMessage(from_users=BOT_USER))
     async def on_message(event):
-        global _mines, _raw
+        global _mines, _raw, _last_update_time
         text = event.message.text or ""
         parsed = parse_mines(text)
         if parsed:
             _mines = parsed
             _raw   = text
+            _last_update_time = time.time()
             log.info(f"Новое сообщение: {len(parsed)} шахт")
         elif text.strip():
-            # Сохраняем сырой текст для дебага
             _raw = text
+            log.info(f"Получено сообщение (не распаршено): {text[:100]}...")
 
-    await refresh()
+    await fetch_snapshot()
     log.info(f"Слушаю @{BOT_USER}...")
+
+    async def auto_refresh_loop():
+        while True:
+            await asyncio.sleep(25)
+            await fetch_snapshot()
+
+    asyncio.ensure_future(auto_refresh_loop())
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
@@ -135,3 +164,4 @@ if __name__ == "__main__":
            daemon=True).start()
     log.info(f"HTTP на порту {PORT}")
     asyncio.run(main())
+
