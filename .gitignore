@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+tg-session/
+tg-session.session
+*.session
